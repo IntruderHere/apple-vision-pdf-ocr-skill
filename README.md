@@ -19,7 +19,8 @@ The skill reads the PyMuPDF text layer first; pages that turn out to be scans (f
 - **Performance:** parallel page processing (ThreadPoolExecutor) with rotating autorelease pools — stable memory (~700–800 MB), ~2.4 pages/s on 6 threads.
 - **High-res re-OCR:** `crop_ocr()` runs Vision over the full page at a low dpi to find the line, then at 800+ dpi over that strip only — fixes garbled formulas, superscripts and requisites without the cost of a full-page high-dpi pass.
 - **Table rows in reading order:** `scripts/vision_table_row.py` returns the cells of one table row left to right (label → y-band → sort by x), with per-block bounding boxes available for anything else.
-- **Knowledge base:** `SKILL.md` documents pyobjc pitfalls (autorelease pools, no manual release — SIGSEGV, 1-based page indices, why a hand-rolled `CGBitmapContextCreate` must pass `bytesPerRow=0` + explicit colorspace) and OCR artifacts ("№" → `Nº`, dropped letters, broken numbers), plus a playbook for form headers (КС-2/КС-3, acts) and arithmetic self-checks of recognised numbers. `references/upd.md` covers the УПД fields (ОПС index, totals).
+- **Self-check:** `scripts/make_test_scan.py` builds a synthetic sample (a PDF with a real text layer, the same page as a PNG, and an image-only PDF) so OCR changes are verified without touching real documents.
+- **Knowledge base:** `SKILL.md` documents pyobjc pitfalls (autorelease pools, no manual release — SIGSEGV, 1-based page indices, why a hand-rolled `CGBitmapContextCreate` must pass `bytesPerRow=0` + explicit colorspace) and OCR artifacts ("№" → `Nº`, dropped letters, broken numbers), plus a playbook for form headers (КС-2/КС-3, acts) and arithmetic self-checks of recognised numbers. `references/upd.md` maps the УПД fields (counterparty, totals line, sum checks).
 
 ### Requirements
 
@@ -89,7 +90,8 @@ for matched, lines in vision_ocr.crop_ocr('act.pdf', 0, 'Итого', dpi=800):
 | `SKILL.md` | Skill prompt: OCR strategy, pyobjc pitfalls, recognition artifacts, form-header playbook |
 | `vision_ocr.py` | Ready-to-use script: CLI + importable functions (`ocr_pdf`, `ocr_image`, `vision_page`, `crop_ocr`) |
 | `scripts/vision_table_row.py` | CLI + helpers to read one table row by label (`render_page`, `ocr_bboxes`) |
-| `references/upd.md` | УПД field map: where the ОПС index and the totals line are, how to verify sums |
+| `scripts/make_test_scan.py` | Generates a synthetic scan (text PDF + image-only PDF + PNG) for smoke tests |
+| `references/upd.md` | УПД field map: key fields, the totals line, how to verify sums |
 
 ---
 
@@ -106,7 +108,8 @@ for matched, lines in vision_ocr.crop_ocr('act.pdf', 0, 'Итого', dpi=800):
 - **Производительность:** параллельная обработка страниц (ThreadPoolExecutor), ротация autorelease-пулов — память стабильна (~700–800 МБ), ~2.4 стр/сек на 6 потоках.
 - **Высоко-резкое повторное OCR:** `crop_ocr()` находит строку Vision'ом на низком dpi, затем распознаёт только её полоску из рендера 800+ dpi — чинит схлопнувшиеся формулы, верхние индексы и реквизиты без медленного прохода всей страницы на высоком разрешении.
 - **Строки таблиц по порядку:** `scripts/vision_table_row.py` печатает клетки одной строки слева→направо (метка → y-полоса → сортировка по x) и отдаёт bbox всех блоков, если нужно своё чтение.
-- **База знаний:** в `SKILL.md` задокументированы подводные камни pyobjc (autorelease-пулы, запрет ручного release — SIGSEGV, 1-based индексы страниц, обязательные `bytesPerRow=0` и явный colorspace в `CGBitmapContextCreate`) и артефакты распознавания («№» → `Nº`, опавшие буквы, разорванные номера), а также порядок чтения реквизитов шапки бланков (КС-2/КС-3, акты) и арифметическая проверка распознанных цифр. В `references/upd.md` — карта полей УПД (индекс ОПС, суммы).
+- **Самопроверка:** `scripts/make_test_scan.py` собирает синтетический образец (PDF с настоящим текстовым слоем, та же страница в PNG и PDF только из картинки) — правки OCR проверяются, не трогая реальные документы.
+- **База знаний:** в `SKILL.md` задокументированы подводные камни pyobjc (autorelease-пулы, запрет ручного release — SIGSEGV, 1-based индексы страниц, обязательные `bytesPerRow=0` и явный colorspace в `CGBitmapContextCreate`) и артефакты распознавания («№» → `Nº`, опавшие буквы, разорванные номера), а также порядок чтения реквизитов шапки бланков (КС-2/КС-3, акты) и арифметическая проверка распознанных цифр. В `references/upd.md` — карта полей УПД (контрагент, строка итогов, проверка сумм).
 
 ### Требования
 
@@ -176,7 +179,8 @@ for matched, lines in vision_ocr.crop_ocr('акт.pdf', 0, 'Итого', dpi=800
 | `SKILL.md` | Промпт скилла: стратегия OCR, подводные камни pyobjc, артефакты распознавания, порядок чтения шапки бланков |
 | `vision_ocr.py` | Готовый скрипт: CLI + импортируемые функции (`ocr_pdf`, `ocr_image`, `vision_page`, `crop_ocr`) |
 | `scripts/vision_table_row.py` | CLI + хелперы для чтения одной строки таблицы по метке (`render_page`, `ocr_bboxes`) |
-| `references/upd.md` | Карта полей УПД: где индекс ОПС и строка итогов, как проверять суммы |
+| `scripts/make_test_scan.py` | Генерирует синтетический скан (текстовый PDF + PDF из картинки + PNG) для самопроверки |
+| `references/upd.md` | Карта полей УПД: ключевые поля, строка итогов, как проверять суммы |
 
 ---
 

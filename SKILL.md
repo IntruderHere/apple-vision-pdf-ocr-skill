@@ -167,6 +167,28 @@ for b in sorted(blocks, key=lambda b: -b['y_center']):
 и клетки соседних строк (например, последняя позиция над итоговой) —
 разбирать по арифметически сходящимся группам, не по порядку.
 
+## Самопроверка после правок скриптов
+
+Правили `vision_ocr.py` / `scripts/vision_table_row.py` — проверяйте на синтетическом
+«скане», а не на документах пользователя:
+
+```bash
+python3 /path/to/this/skill/scripts/make_test_scan.py /tmp/ocrtest
+python3 /path/to/this/skill/vision_ocr.py /tmp/ocrtest/test_scan.pdf
+python3 /path/to/this/skill/scripts/vision_table_row.py \
+        /tmp/ocrtest/test_scan.pdf --page 0 --label "Всего к оплате"
+```
+
+Ожидаемо: `Всего к оплате | 6200,00 | 1 033,33 | 7 233,33` (Vision теряет пробел
+в первой сумме — норма), `crop_ocr(..., 'нет такой строки')` → `[]`, а `test_text.pdf`
+читается с текстового слоя без вызова Vision. Два файла из генератора различаются
+именно наличием текстового слоя — на них проверяются обе ветки (`get_text()` и Vision).
+
+Гоняйте скрипты из ТОЙ папки, где лежит итоговая версия: после синхронизации —
+из клона репозитория. `scripts/vision_table_row.py` сам добавляет родительскую
+папку в `sys.path`, и битый layout (`vision_ocr.py` не рядом со `scripts/`)
+всплывает только при запуске из опубликованного дерева.
+
 ## Быстрый старт
 
 ```bash
@@ -181,4 +203,4 @@ python3 /path/to/this/skill/vision_ocr.py "scan.pdf" photo.jpg > text.txt
 `python3 /path/to/this/skill/scripts/vision_table_row.py scan.pdf --page 1 --label "Всего к оплате"`
 (если метка не находится — см. «Реквизиты шапки формы», читайте bbox напрямую)
 
-УПД (куда смотреть ОПС-индекс и сумму, формат отчёта) — `references/upd.md`.
+УПД (куда смотреть ключевые поля и сумму, формат отчёта) — `references/upd.md`.
