@@ -851,7 +851,8 @@ def main():
                                      else reading_order(body))
                             rendered.append(f'--- page {page_no} ---\n' + '\n'.join(lines))
                     elif args.json:
-                        rendered.append({'page': page_no, 'text': body})
+                        key = 'error' if kind == 'error' else 'text'
+                        rendered.append({'page': page_no, key: body})
                     else:
                         rendered.append(f'--- page {page_no} ---\n{body}')
                 if args.json:
