@@ -1,12 +1,11 @@
 ---
 name: apple-vision-pdf-ocr
 display-name: Apple Vision PDF OCR
-description: OCR сканов PDF и картинок через Apple Vision на macOS.
-  Использовать, когда нужно извлечь текст из PDF/изображений без текстового
-  слоя.
-version: "1.1"
+description: OCR сканов PDF и картинок через Apple Vision (macOS).
+version: "1.2"
 author: ivan
 license: MIT
+platforms: [macos]
 tags: [ocr, pdf, images, vision, quartz, pyobjc]
 related_skills: []
 ---
@@ -16,191 +15,175 @@ related_skills: []
 ## When to Use
 
 - PDF-файлы без текстового слоя (сканы, фотографии документов) — нужно извлечь текст.
-- Отдельные изображения (PNG, JPG, TIFF) — нужен OCR русского/английского текста.
+- Отдельные изображения (PNG, JPG, TIFF, HEIC) — нужен OCR русского/английского текста.
 - Документы с табличками/сметами/датами словами — Accurate уровень Vision лучше Fast.
-- **Не использовать** для PDF с уже присутствующим текстовым слоем — PyMuPDF вытянет его мгновенно; OCR-скрипт сам распознаёт и пропустит такие страницы.
+- **Не использовать** для PDF с настоящим текстовым слоем — PyMuPDF вытянет его мгновенно; скрипт сам отличает слой от «мусорного» (см. ниже) и такие страницы пропустит.
 
-Доступно только на macOS (`platform.system() == 'Darwin'`). В python нужен pyobjc
-(`Vision`, `Quartz`, `Foundation`, `objc`) — на системном Python 3, например
-`/Library/Frameworks/Python.framework/Versions/3.13/bin/python3`.
-В изолированном sandbox-окружении (run_python) pyobjc обычно **нет** —
-выполняйте скрипты через `shell_command` с системным `python3`.
+Только macOS: нужен pyobjc (`Vision`, `Quartz`, `Foundation`, `objc`) — на системном
+Python 3, например `/Library/Frameworks/Python.framework/Versions/3.13/bin/python3`.
+В sandbox-окружении (run_python) pyobjc обычно **нет** — выполняйте скрипты через
+`terminal` с системным `python3`.
 
 ## Стратегия
 
-1. **Сначала текстуровый слой** через PyMuPDF (`fitz`): `page.get_text('text')`.
-   Страница считается «сканом», если `len(text.strip()) < 40` — только такие
-   страницы (или всё изображение целиком) отправлять в Vision.
-2. **Рендер страницы** в CGImage при ~150 dpi:
-   - основной путь: Quartz — `CGPDFDocumentCreateWithURL` →
-     `CGPDFDocumentGetPage` (1-based!) → `CGBitmapContextCreate` +
-     `CGContextDrawPDFPage` → `CGBitmapContextCreateImage`;
-   - **fallback** (редко, ~1-2% PDF): Quartz не читает страницу
-     (`CGPDFDocumentGetPage` вернул None / «cannot read page») — рендерим её
-     PyMuPDF `page.get_pixmap(dpi=150, alpha=False)` → сохраняем PNG →
-     `CGImageSourceCreateWithURL` → `CGImageSourceCreateImageAtIndex(src, 0, None)`.
-3. **OCR**: `Vision.VNRecognizeTextRequest`,
-   `setRecognitionLanguages_(["ru-RU", "en-US"])`,
-   уровень `VNRequestTextRecognitionLevelAccurate`,
-   `setUsesLanguageCorrection_(True)`,
-   `VNImageRequestHandler(initWithCGImage_options_:(img, None))`,
-   `performRequests_error_([req], None)`. Текст из `obs.topCandidates_(1)[0].string()`.
-4. Картинки (jpg/png/tif): PIL → RGB → PNG → `CGImageSourceCreateWithURL` → тот же Vision.
+1. **Настоящий ли текстовый слой.** Страница считается сканом, если её *видимый*
+   текст короче 40 символов **или** слой занимает < 1 % площади при наличии картинок.
+   Невидимые спаны (render mode 3, opacity 0, белая заливка) не считаются: печать
+   ЭДО/ЭП вида «Сформировано в системе …» — не содержимое страницы. Раньше такой
+   «слой» молча отменял OCR, и страница терялась целиком. Флаг `--force-ocr` OCR-ит
+   всё принудительно.
+2. **Рендер страницы** в CGImage при 150 dpi (Quartz; PyMuPDF — fallback для ~1–2 %
+   битых PDF). `pdf_page_cgimage()` — единственная точка рендера страницы.
+3. **OCR**: `VNRecognizeTextRequest`, `["ru-RU", "en-US"]`, Accurate,
+   `usesLanguageCorrection`, `VNImageRequestHandler(initWithCGImage_options_)`.
+   `vision_blocks()` отдаёт блоки с `text`, `confidence` и bbox `x, y, w, h`
+   (нормированные 0..1, начало координат — **снизу слева**).
+4. Текстовый слой отдаётся с нормализованными пробелами (NBSP → обычный пробел),
+   чтобы `'Всего к оплате' in text` работал так же, как после OCR.
+5. Картинки: ImageIO напрямую, PIL — только fallback для экзотических форматов.
 
-Готовый скрипт в этой папке: **`vision_ocr.py`** — принимает PDF/PNG/JPG/TIFF,
-сначала пробует текстуровый слой (PDF), сканы и картинки распознаёт Vision.
-Порядок строк: Vision возвращает блоки без порядка — для читаемого текста
-отсортируйте по bbox (y сверху вниз, потом x) либо просто берите `results()`
-как есть, если порядок не важен. Для строки ТАБЛИЦЫ (клетки одной строки,
-слева→направо) `vision_page()`/`vision_ocr_lines()` не подходят — координаты
-не возвращают; используйте **`scripts/vision_table_row.py`**: метка строки →
-y-полоса ±band → сортировка блоков по x (собственный проход Vision с bbox).
+## Порядок чтения
+
+Vision возвращает блоки без порядка — на таблице это выдача по колонкам.
+`reading_order(blocks)` собирает визуальные строки (по перекрытию bbox по y),
+сортирует сверху вниз, а клетки строки склеивает **табом**: строка читается и
+парсится как одна запись. `--raw` в CLI — сырой порядок Vision для отладки.
+
+Страница «на боку» (фото, повёрнутое на 90°): блоки вытянуты по вертикали —
+`ocr_upright()` замечает поворот по геометрии блоков и до-разворачивает
+изображение, выбирая из вариантов 90°/270° тот, где заголовок оказывается сверху.
+Перевёрнутые на 180° сканы не исправляются (дешёвого признака нет) — разверните
+файл заранее.
 
 ## Подводные камни pyobjc (важно!)
 
-- `NSAutoreleasePool` в pyobjc — **НЕ context manager**: создавать
-  `NSAutoreleasePool.alloc().init()` и вызывать `.drain()` вручную
-  (можно оборачивать в `contextmanager`, но drain всегда в `finally`).
-  При потоках — пул на поток (`threading.local`), ротировать пул каждые ~50
-  запросов Vision, чтобы память не росла.
-- **Никогда** не вызывайте ручные release (`CFRelease`, `CGContextRelease`,
-  `CGPDFDocumentClose`…) — в этой версии pyobjc `CGPDFDocumentClose` даже нет,
-  а ручной release результата `CGBitmapContextCreateImage` приводит к
-  двойному освобождению и **SIGSEGV**. Владелец объектов — python-обёртки +
-  autorelease-пулы.
+- **Пул — один на вызов публичной функции**, через `objc.autorelease_pool()`
+  (контекстный менеджер). Не создавайте `NSAutoreleasePool` и не зовите `drain()`
+  руками: python-обёртка продолжает владеть пулом, и поздний dealloc освобождает
+  его второй раз («pool has already been drained») — на длинных прогонах это
+  SIGSEGV, а до него Vision начинает возвращать пустые страницы.
+- **Никогда** не вызывайте ручные release (`CFRelease`, `CGImageRelease`,
+  `CGContextRelease`, `CGPDFDocumentClose`): метаданные pyobjc помечают результат
+  `CGBitmapContextCreateImage` как `already_cfretained`, обёртка освобождает его
+  сама — ручной release даёт двойное освобождение и падение.
+- **Не гоняйте страницу через «PyMuPDF → PNG → CGImageSource» в цикле**: после
+  ~25–30 таких циклов в одном процессе Vision перестаёт возвращать результат
+  (запрос висит навсегда). Рендерите Quartz'ом (`pdf_page_cgimage`,
+  `pdf_region_cgimage`); PNG-путь оставлен только аварийным fallback.
+- **Vision инициализируется лениво**: первый параллельный батч в нескольких потоках
+  даёт часть пустых страниц. Перед пулом потоков `ocr_pdf_pages()` делает один
+  дешёвый прогрев (72 dpi) на текущем потоке — не убирайте его.
 - `CGPDFDocumentGetPage(doc, n)` — **1-based** индекс страницы.
-- `CGContextScaleCTM(ctx, scale, scale)` перед `CGContextDrawPDFPage`; фон —
-  белый `CGContextSetRGBFillColor(ctx,1,1,1,1)` + `CGContextFillRect`.
-- Собственный рендер (не через `_vision_page`):
-  `CGBitmapContextCreate(None, w, h, 8, 0, CGColorSpaceCreateDeviceRGB(),
-  kCGImageAlphaPremultipliedLast)` — `bytesPerRow=0` и явный colorspace
-  обязательны; иначе контекст 0×0 и Vision отклоняет «zero-dimensioned image
-  (0 x 0)». CGRect — `CGContextMake(0,0,w,h)` или вложенный кортеж
-  `((x,y),(w,h))`; «плоский» `(x,y,w,h)` pyobjc не примет (ValueError при
-  депипонизации).
-- URL для Quartz: `CFURLCreateWithFileSystemPath(None, abs_path, kCFURLPOSIXPathStyle, False)`
-  (или `Foundation.NSURL.fileURLWithPath_`).
+- `CGContextScaleCTM` + `CGContextTranslateCTM` перед `CGContextDrawPDFPage`; фон —
+  белый `CGContextSetRGBFillColor` + `CGContextFillRect`.
+- Собственный рендер: `CGBitmapContextCreate(None, w, h, 8, 0,
+  CGColorSpaceCreateDeviceRGB(), kCGImageAlphaPremultipliedLast)` — `bytesPerRow=0`
+  и явный colorspace обязательны, иначе контекст 0×0 и Vision отклоняет
+  «zero-dimensioned image (0 x 0)». CGRect — `CGContextMake` или вложенный кортеж;
+  «плоский» `(x, y, w, h)` pyobjc не примет.
+- URL для Quartz: `CFURLCreateWithFileSystemPath(None, abs_path,
+  kCFURLPOSIXPathStyle, False)`.
 
-## Производительность и артефакты
+## Производительность и память
 
-- ~2.4 страницы/сек при 6 потоках; память стабилизируется ~700-800 МБ с
-  ротируемыми пулами. Для десятков-сотен страниц берите ThreadPoolExecutor
-  и пул на поток.
-- Vision читает «№» как `Nº`/`No`/`Ne` — нормализуйте:
-  `re.sub(r'(?<![A-Za-zА-Яа-яЁё])N\s*[ºoоO0](?![а-яёa-zА-ЯЁё])', '№ ', s)`.
-- Буквы в словах иногда «опадают» («Дефектная» → «Дефекная»), номера дел
-  и дат бывают разорваны переносами строк — при парсинге реквизитов
-  допускайте пробелы и символы `[-–/]` внутри номеров.
-- Российские даты часто в форме «30 июня 2021 г.» — ищите месяцы словами.
-- Плотные таблички/сметы: Accurate уровень медленно, но надёжнее Fast;
-  для огромных объёмов можно Fast, если допустимы ошибки.
+- ~6–8 страниц/сек на 4 потоках (`--workers` по умолчанию `min(4, CPU)`); память на
+  десятках страниц держится в пределах нескольких сотен МБ.
+- Vision удерживает изображение каждого запроса: `crop_ocr` стоит ~15–20 МБ RSS на
+  вызов, поэтому длинный батч кропов доходит до ~1.5–2 ГБ. Для больших объёмов
+  делите работу по документам/диапазонам страниц (`--pages`), а не гоните сотни
+  кропов в одном процессе.
+- OCR-артефакты: «№» → `Nº`/`No`/`Ne` (нормализуйте регуляркой
+  `re.sub(r'(?<![A-Za-zА-Яа-яЁё])N\s*[ºoоO0](?![а-яёa-zА-ЯЁё])', '№ ', s)`),
+  опавшие буквы («Дефектная» → «Дефекная»), разорванные переносами номера и даты,
+  «30 июня 2021 г.» словами. Плотные сметы — Accurate медленно, но надёжнее Fast.
 
 ## Высоко-резкое повторное OCR (неразборчивые места)
 
-Если отдельная строка распознана мусором — формула схлопнулась в
-`= 7` / `= =`, слово выросло до абсурда («пошех»), номер/реквизит
-искажён, верхний/нижний индекс потерян — не доверяйте одному проходу 150 dpi:
-1. `vision_page(path, idx, dpi=300)` — пере-OCR всей страницы (300 dpi ≈ 4x
-   пикселей, заметно медленнее);
-2. всё ещё неясно — `crop_ocr(path, idx, needle, det_dpi=200, dpi=800)`:
-   двухэтапно — строки с `needle` находит Vision на низком `det_dpi` (быстро),
-   затем вырезанную полоску берёт из рендера в `dpi` (800+) и OCR-ит только
-   кроп. **Никогда не гоняйте Vision по полной странице на 500+ dpi** —
-   это в разы медленнее (минуты на страницу); bbox линейно масштабируется,
-   поэтому детекция на 200 dpi + кроп с 800 dpi дают тот же результат.
+`crop_ocr(path, page, needle, det_dpi=300, dpi=800, row=False)`:
+1. детекция — Vision по всей странице при `det_dpi`; если совпадений нет,
+   автоматически повторяет при `retries=(450,)` (Vision теряет мелкий текст на
+   низком разрешении — это и давало молчаливый `[]`);
+2. сравнение с `needle` нечувствительно к регистру, ё/е и потерянным пробелам
+   внутри чисел;
+3. кроп рисуется **только для нужной полосы** (`pdf_region_cgimage`) и OCR-ится при
+   `dpi`; при `row=True` берётся вся визуальная строка — клетки таблицы или вся
+   формула, а не одна подпись.
 
-Верхние индексы — слабое место: номера сносок читаются как §/И/3, дроби в
-формулах (t/T) схлопываются в «7» или «=». Формулы и реквизиты (номера
-приказов, даты, инициалы) всегда верифицируйте через `crop_ocr`.
+Порядок при мусоре в строке: сначала `vision_page(..., dpi=300)`, затем
+`crop_ocr(..., row=True)`. Верхние индексы — слабое место Vision (сноски читаются
+как §/И/3, дроби схлопываются в «7»); формулы и реквизиты проверяйте `crop_ocr`.
+Низкая `confidence` в `vision_blocks()` — прямой сигнал перечитать блок кропом,
+не дожидаясь явного мусора.
 
 ## Реквизиты шапки формы (КС-2, КС-3, акты, СЗ-бланки)
 
-Нужны не «весь текст», а конкретные клетки: номер/дата договора, № акта,
-«Дата составления», «Отчетный период», «Сметная стоимость».
-
-1. Скан-формы (КС-2/КС-3) обычно без текстового слоя — сразу Vision, не тратя
-   проход на `get_text()`. Предупреждения `Unexpected EOF in JBIG2 stream`
-   при рендере — шум декодера, страница читается нормально.
+1. Скан-формы обычно без текстового слоя — сразу OCR. Предупреждения
+   `Unexpected EOF in JBIG2 stream` при рендере — шум декодера, страница читается.
 2. `vision_table_row.py --label "Дата составления"` находит строку только при
-   точном совпадении с распознанным текстом: Vision стабильно портит
-   подписи («Дата составпения», «Сметкая стоимость»), и метка не находится.
-   Не перебирайте варианты — читайте координаты напрямую:
+   совпадении с распознанным текстом: Vision портит подписи («Дата составпения»,
+   «Сметкая стоимость»). Тогда читайте координаты напрямую:
 
 ```python
 import sys
 sys.path.insert(0, '/path/to/this/skill')
-sys.path.insert(0, '/path/to/this/skill/scripts')
-import vision_table_row as vt
-img = vt.render_page('ks2.pdf', 0, 250)      # 250 dpi хватает для шапки
-blocks = vt.ocr_bboxes(img)                  # bbox: origin СНИЗУ-слева, 0..1
-for b in sorted(blocks, key=lambda b: -b['y_center']):
-    if 0.73 < b['y_center'] < 0.81 and b['x0'] > 0.30:
-        print(f"y={b['y_center']:.3f} x={b['x0']:.3f} :: {b['text']}")
+import vision_ocr
+img = vision_ocr.pdf_page_cgimage('ks2.pdf', 0, 250)
+for b in sorted(vision_ocr.vision_blocks(img), key=lambda b: -b['y']):
+    if 0.73 < b['y'] < 0.81 and b['x'] > 0.30:
+        print(f"y={b['y']:.3f} x={b['x']:.3f} conf={b['confidence']:.2f} :: {b['text']}")
 ```
 
-3. `y_center` — нормированная координата от НИЗА страницы: шапка бланка
-   лежит в верхних 20–30 %, то есть y ≈ 0.7–0.85, а не 0.15–0.30. Значение
-   поля — блок с тем же `y_center` (±0.005) и `x0` правее подписи; подписи
-   и значения часто распознаются с разным `x0`, поэтому фильтруйте по
-   полосе y, а не по номеру строки.
-4. Значения читайте как есть: «1179_25-рдог-МР78» (подчёркивание вместо
-   слэша), «27.03.2026». Номер акта в клетке «Номер документа» может выйти
-   мусором («HOMED») — тогда в отчёт берите дату и объект, а номер акта не
-   выдумывайте.
-5. **Штамп исходящей даты/номера (ЭП, «08.10.2026 № КС/47757/26») OCR не
-   берёт вообще** — это оттиск подписи, отрисованный как appearance виджета
-   (`/Annots` → `/Widget` → `/AP` → `/N`), а не текст страницы: его нет ни в
-   текстовом слое, ни в рендере на 300–500 dpi, ни в кропе. Проверяйте наличие
-   штампа через `pypdf`: `[a.get_object().get('/Subtype') for a in page['/Annots']]`
-   и поля `/Widget` с `/T` наподобие `Reg_...`. Не подставляйте вместо даты
-   `/CreationDate` (это время записи файла, а не дата письма) и не пишите
-   пользователю «даты нет» — попросите скриншот шапки: человек видит оттиск
-   в просмотрщике.
+3. `y` — нормированная координата от **низа** страницы: шапка бланка лежит в верхних
+   20–30 %, то есть y ≈ 0.7–0.85. Значение поля — блок в той же полосе y и правее
+   подписи; фильтруйте по полосе, а не по номеру строки.
+4. Значения берите как распознаны («1179_25-рдог-МР78», «27.03.2026»); мусор в
+   «Номер документа» — не повод выдумывать номер.
+5. **Штамп исходящей даты/номера (ЭП, «08.10.2026 № КС/47757/26») OCR не берёт
+   вообще** — это appearance виджета (`/Annots` → `/Widget` → `/AP` → `/N`), а не
+   текст: его нет ни в слое, ни в рендере, ни в кропе. Проверяйте через `pypdf`:
+   подтипы `/Widget` и поля `/T` вида `Reg_...`. Не подставляйте `/CreationDate`
+   (это время записи файла) и не пишите «даты нет» — попросите скриншот шапки.
 
 ## Верификация распознанных цифр
 
-Дешевле crop_ocr — арифметика самой строки: в строках итогов
-«без налога + сумма налога = итого с налогом», в строках позиций
-«цена × количество = стоимость». Если тройки сходятся во всех документах —
-цифры прочитаны верно, повторный кроп не нужен; только при несходжении —
-`crop_ocr`. При банд-чтении строки (`vision_table_row.py`) в полосу попадают
-и клетки соседних строк (например, последняя позиция над итоговой) —
+Дешевле `crop_ocr` — арифметика строки: «без налога + налог = итого», «цена ×
+количество = стоимость». Сходятся во всех документах — цифры прочитаны верно.
+Банд-чтение строки (`vision_table_row.py`) подхватывает клетки соседних строк —
 разбирать по арифметически сходящимся группам, не по порядку.
 
 ## Самопроверка после правок скриптов
 
-Правили `vision_ocr.py` / `scripts/vision_table_row.py` — проверяйте на синтетическом
-«скане», а не на документах пользователя:
-
 ```bash
-python3 /path/to/this/skill/scripts/make_test_scan.py /tmp/ocrtest
-python3 /path/to/this/skill/vision_ocr.py /tmp/ocrtest/test_scan.pdf
-python3 /path/to/this/skill/scripts/vision_table_row.py \
-        /tmp/ocrtest/test_scan.pdf --page 0 --label "Всего к оплате"
+python3 /path/to/this/skill/scripts/selftest.py        # ~30 с
+python3 /path/to/this/skill/scripts/selftest.py --keep # оставить образцы
 ```
 
-Ожидаемо: `Всего к оплате | 6200,00 | 1 033,33 | 7 233,33` (Vision теряет пробел
-в первой сумме — норма), `crop_ocr(..., 'нет такой строки')` → `[]`, а `test_text.pdf`
-читается с текстового слоя без вызова Vision. Два файла из генератора различаются
-именно наличием текстового слоя — на них проверяются обе ветки (`get_text()` и Vision).
-
-Гоняйте скрипты из ТОЙ папки, где лежит итоговая версия: после синхронизации —
-из клона репозитория. `scripts/vision_table_row.py` сам добавляет родительскую
-папку в `sys.path`, и битый layout (`vision_ocr.py` не рядом со `scripts/`)
-всплывает только при запуске из опубликованного дерева.
+Скрипт сам строит синтетические образцы (текстовый PDF, скан, PNG, PDF со
+«штампом» невидимого слоя, плотная таблица 9 pt, 12-страничный скан) и проверяет
+порядок чтения, детект слоя, `crop_ocr` (включая retry и `row=True`), отсутствие
+пустых страниц в 4 потока, `vision_table_row` и JSON-режим CLI. Гоняйте его из ТОЙ
+папки, где лежит итоговая версия (после синхронизации — из клона репозитория):
+`scripts/vision_table_row.py` сам добавляет родительскую папку в `sys.path`, и битый
+layout всплывает только в опубликованном дереве.
 
 ## Быстрый старт
 
 ```bash
-python3 /path/to/this/skill/vision_ocr.py "scan.pdf" photo.jpg > text.txt
+python3 /path/to/this/skill/vision_ocr.py scan.pdf photo.jpg > text.txt
+python3 /path/to/this/skill/vision_ocr.py big.pdf --pages 1-5,9 --json > blocks.json
+python3 /path/to/this/skill/vision_ocr.py scan.pdf --force-ocr --workers 6
 ```
 
-или импортировать функции из `vision_ocr.py`:
-`ocr_pdf(path)`, `ocr_image(path)`, `vision_page(path, page_index, dpi=150)`,
-`crop_ocr(path, page_index, needle, det_dpi=200, dpi=800)`.
+Библиотека: `ocr_pdf(path)`, `ocr_pdf_pages(path)` (по страницам: `text` / `blocks` /
+`error`), `ocr_image(path)`, `vision_page(path, idx, dpi=150)`,
+`vision_blocks(cgimage)`, `reading_order(blocks)`, `crop_ocr(...)`,
+`pdf_page_cgimage(...)`, `pdf_region_cgimage(...)`.
+CLI: `--pages` (1-based), `--force-ocr`, `--json`, `--raw`, `--workers`, `--dpi`.
 
 Строка таблицы по метке (клетки слева→направо):
 `python3 /path/to/this/skill/scripts/vision_table_row.py scan.pdf --page 1 --label "Всего к оплате"`
-(если метка не находится — см. «Реквизиты шапки формы», читайте bbox напрямую)
+(`--json` — клетки с bbox и confidence; если метка не находится — см. «Реквизиты
+шапки формы»).
 
 УПД (куда смотреть ключевые поля и сумму, формат отчёта) — `references/upd.md`.
+

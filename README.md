@@ -10,17 +10,19 @@ A skill that teaches the agent to extract text from scanned PDFs and images usin
 
 ### What it does
 
-The skill reads the PyMuPDF text layer first; pages that turn out to be scans (fewer than 40 characters of text) are rendered to a CGImage at ~150 dpi and OCR'd with Apple Vision (ru-RU + en-US). Raster images are sent to Vision directly.
+The skill reads the PyMuPDF text layer first, but only trusts it when that layer is *visible* text covering a real part of the page: a scan carrying an invisible EDMS stamp ("Сформировано в системе …") is OCR'd, not skipped. Scan pages are rendered to a CGImage at ~150 dpi and read with Apple Vision (ru-RU + en-US). Output comes in reading order — one visual line per row, cells of a table row joined by a tab. Raster images go to Vision directly.
 
 ### Features
 
-- **PDF:** pages with a text layer are read directly; "scans" (pages with < 40 chars) are rendered to CGImage (~150 dpi) and OCR'd with Vision, with a PyMuPDF render fallback for rare broken PDFs.
-- **Images:** PNG/JPG/TIFF are OCR'd directly via Vision.
-- **Performance:** parallel page processing (ThreadPoolExecutor) with rotating autorelease pools — stable memory (~700–800 MB), ~2.4 pages/s on 6 threads.
-- **High-res re-OCR:** `crop_ocr()` runs Vision over the full page at a low dpi to find the line, then at 800+ dpi over that strip only — fixes garbled formulas, superscripts and requisites without the cost of a full-page high-dpi pass.
-- **Table rows in reading order:** `scripts/vision_table_row.py` returns the cells of one table row left to right (label → y-band → sort by x), with per-block bounding boxes available for anything else.
-- **Self-check:** `scripts/make_test_scan.py` builds a synthetic sample (a PDF with a real text layer, the same page as a PNG, and an image-only PDF) so OCR changes are verified without touching real documents.
-- **Knowledge base:** `SKILL.md` documents pyobjc pitfalls (autorelease pools, no manual release — SIGSEGV, 1-based page indices, why a hand-rolled `CGBitmapContextCreate` must pass `bytesPerRow=0` + explicit colorspace) and OCR artifacts ("№" → `Nº`, dropped letters, broken numbers), plus a playbook for form headers (КС-2/КС-3, acts) and arithmetic self-checks of recognised numbers. `references/upd.md` maps the УПД fields (counterparty, totals line, sum checks).
+- **Page detection:** a page goes to Vision when its *visible* text layer has fewer than 40 characters, or covers under 1 % of a page that carries images; invisible or white text never counts as content. `--force-ocr` overrides.
+- **Images:** PNG/JPG/TIFF/HEIC are read through ImageIO; PIL only as a fallback for exotic formats.
+- **Reading order:** blocks are grouped into visual lines by bbox overlap, sorted top→bottom, cells of one row joined with a tab; `--raw` keeps Vision's own order for debugging. A sideways page (a photo rotated 90°) is detected and turned upright before OCR.
+- **CLI:** `--pages 1-5,9`, `--force-ocr`, `--json` (per-page text, or blocks with bboxes and confidence), `--workers` (default `min(4, CPUs)`), `--dpi`.
+- **Performance:** parallel page OCR (ThreadPoolExecutor), one autorelease pool per call — ~6–8 pages/s on 4 threads.
+- **High-res re-OCR:** `crop_ocr()` finds the line at 300 dpi (auto-retry at 450 when the needle is missed), then re-reads only that strip from an 800-dpi region render; `row=True` takes the whole visual line. Matching ignores case, ё/е and lost spaces inside numbers.
+- **Table rows:** `scripts/vision_table_row.py` prints the cells of one table row left to right (label → y-band → sort by x), `--json` for machine use.
+- **Self-check:** `scripts/selftest.py` builds the fixtures (text PDF, scan, watermark scan, dense 9 pt table, 12-page scan) and asserts 21 checks; `scripts/make_test_scan.py` writes just the three base files.
+- **Knowledge base:** `SKILL.md` documents pyobjc pitfalls — one `objc.autorelease_pool()` per call (manual `drain()` double-releases → SIGSEGV and empty pages), never `CGImageRelease` (pyobjc already owns the image), why a PyMuPDF→PNG→CGImageSource loop wedges Vision after ~30 calls, the Vision warm-up before spawning threads, 1-based page indices, `bytesPerRow=0` + explicit colorspace — plus OCR artifacts and a form-header playbook; `references/upd.md` maps the УПД fields.
 
 ### Requirements
 
@@ -62,15 +64,21 @@ python3 vision_ocr.py scan.pdf photo.jpg > text.txt
 python3 vision_ocr.py big_scan.pdf --workers 6 --dpi 150 > text.txt
 ```
 
-Or import the functions: `ocr_pdf(path)`, `ocr_image(path)`, `vision_page(path, page_index, dpi=150)`, `crop_ocr(path, page_index, needle, det_dpi=200, dpi=800)`.
+```bash
+python3 vision_ocr.py big.pdf --pages 1-5,9 --json > blocks.json   # blocks + bboxes
+python3 vision_ocr.py scan.pdf --force-ocr --workers 6            # ignore the text layer
+```
 
-Output: text to stdout; PDF pages are marked with `--- page N ---`. Per-page errors appear as `[OCR ERROR ...]` markers.
+Or import the functions: `ocr_pdf(path)`, `ocr_pdf_pages(path)`, `ocr_image(path)`, `vision_page(path, page_index, dpi=150)`, `vision_blocks(cgimage)`, `reading_order(blocks)`, `crop_ocr(path, page_index, needle, det_dpi=300, dpi=800, row=False)`.
+
+Output: text to stdout in reading order — tab-separated cells, `--- page N ---` markers. Per-page errors appear as `[OCR ERROR ...]` markers.
 
 Read one table row left to right (cells of the row containing the label):
 
 ```bash
 python3 scripts/vision_table_row.py invoice.pdf --page 1 --label "Всего к оплате"
-# → 6 200,00 | 1 033,33 | 7 233,33
+# → Всего к оплате | 6 200,00 | 1 033,33 | 7 233,33
+python3 scripts/vision_table_row.py invoice.pdf --page 1 --label "Всего к оплате" --json
 ```
 
 High-res re-OCR of a single garbled line:
@@ -90,7 +98,8 @@ for matched, lines in vision_ocr.crop_ocr('act.pdf', 0, 'Итого', dpi=800):
 | `SKILL.md` | Skill prompt: OCR strategy, pyobjc pitfalls, recognition artifacts, form-header playbook |
 | `vision_ocr.py` | Ready-to-use script: CLI + importable functions (`ocr_pdf`, `ocr_image`, `vision_page`, `crop_ocr`) |
 | `scripts/vision_table_row.py` | CLI + helpers to read one table row by label (`render_page`, `ocr_bboxes`) |
-| `scripts/make_test_scan.py` | Generates a synthetic scan (text PDF + image-only PDF + PNG) for smoke tests |
+| `scripts/make_test_scan.py` | Generates a synthetic sample (text PDF + image-only PDF + PNG) for smoke tests |
+| `scripts/selftest.py` | Runs the 21-check self-test on generated fixtures |
 | `references/upd.md` | УПД field map: key fields, the totals line, how to verify sums |
 
 ---
@@ -99,17 +108,19 @@ for matched, lines in vision_ocr.crop_ocr('act.pdf', 0, 'Итого', dpi=800):
 
 ### Что делает
 
-Скилл сначала читает текстовый слой PyMuPDF; страницы, оказавшиеся сканами (меньше 40 символов текста), рендерятся в CGImage при ~150 dpi и распознаются Apple Vision (ru-RU + en-US). Растровые картинки отправляются в Vision напрямую.
+Скилл сначала читает текстовый слой PyMuPDF, но доверяет ему только если это *видимый* текст, занимающий реальную часть страницы: скан с невидимой печатью ЭДО («Сформировано в системе …») распознаётся, а не пропускается. Страницы-сканы рендерятся в CGImage при ~150 dpi и читаются Apple Vision (ru-RU + en-US). Вывод идёт в порядке чтения — одна визуальная строка на строку, клетки строки таблицы склеены табом. Растровые картинки отправляются в Vision напрямую.
 
 ### Возможности
 
-- **PDF:** страницы с текстовым слоем читаются напрямую; «сканы» (страницы с < 40 символов) рендерятся в CGImage (~150 dpi) и распознаются Vision; для редких битых PDF есть fallback-рендер через PyMuPDF.
-- **Картинки:** PNG/JPG/TIFF распознаются напрямую через Vision.
-- **Производительность:** параллельная обработка страниц (ThreadPoolExecutor), ротация autorelease-пулов — память стабильна (~700–800 МБ), ~2.4 стр/сек на 6 потоках.
-- **Высоко-резкое повторное OCR:** `crop_ocr()` находит строку Vision'ом на низком dpi, затем распознаёт только её полоску из рендера 800+ dpi — чинит схлопнувшиеся формулы, верхние индексы и реквизиты без медленного прохода всей страницы на высоком разрешении.
-- **Строки таблиц по порядку:** `scripts/vision_table_row.py` печатает клетки одной строки слева→направо (метка → y-полоса → сортировка по x) и отдаёт bbox всех блоков, если нужно своё чтение.
-- **Самопроверка:** `scripts/make_test_scan.py` собирает синтетический образец (PDF с настоящим текстовым слоем, та же страница в PNG и PDF только из картинки) — правки OCR проверяются, не трогая реальные документы.
-- **База знаний:** в `SKILL.md` задокументированы подводные камни pyobjc (autorelease-пулы, запрет ручного release — SIGSEGV, 1-based индексы страниц, обязательные `bytesPerRow=0` и явный colorspace в `CGBitmapContextCreate`) и артефакты распознавания («№» → `Nº`, опавшие буквы, разорванные номера), а также порядок чтения реквизитов шапки бланков (КС-2/КС-3, акты) и арифметическая проверка распознанных цифр. В `references/upd.md` — карта полей УПД (контрагент, строка итогов, проверка сумм).
+- **Детект страницы:** страница уходит в Vision, если её *видимый* текстовый слой короче 40 символов или занимает меньше 1 % площади страницы с картинками; невидимый или белый текст содержимым не считается. `--force-ocr` отключает проверку.
+- **Картинки:** PNG/JPG/TIFF/HEIC читаются через ImageIO, PIL — только fallback для экзотических форматов.
+- **Порядок чтения:** блоки собираются в визуальные строки по перекрытию bbox, сортируются сверху вниз, клетки строки склеиваются табом; `--raw` оставляет порядок Vision для отладки. Страница «на боку» (фото, повёрнутое на 90°) определяется по геометрии блоков и разворачивается перед OCR.
+- **CLI:** `--pages 1-5,9`, `--force-ocr`, `--json` (текст по страницам либо блоки с bbox и confidence), `--workers` (по умолчанию `min(4, CPU)`), `--dpi`.
+- **Производительность:** параллельная обработка страниц (ThreadPoolExecutor), один autorelease-пул на вызов — ~6–8 стр/сек на 4 потоках.
+- **Высоко-резкое повторное OCR:** `crop_ocr()` находит строку на 300 dpi (авторетрай 450, если метка не нашлась), затем перечитывает только её полосу из региона-рендера 800 dpi; `row=True` берёт всю визуальную строку. Сравнение нечувствительно к регистру, ё/е и потерянным пробелам внутри чисел.
+- **Строки таблиц:** `scripts/vision_table_row.py` печатает клетки одной строки слева→направо (метка → y-полоса → сортировка по x), `--json` — для машинной обработки.
+- **Самопроверка:** `scripts/selftest.py` строит образцы (текстовый PDF, скан, скан со «штампом», плотная таблица 9 pt, 12-страничный скан) и проверяет 21 утверждение; `scripts/make_test_scan.py` пишет только три базовых файла.
+- **База знаний:** в `SKILL.md` задокументированы подводные камни pyobjc — один `objc.autorelease_pool()` на вызов (ручной `drain()` даёт двойное освобождение → SIGSEGV и пустые страницы), запрет `CGImageRelease` (pyobjc владеет образом сам), почему цикл «PyMuPDF → PNG → CGImageSource» вешает Vision после ~30 вызовов, прогрев Vision перед пулом потоков, 1-based индексы страниц, обязательные `bytesPerRow=0` и явный colorspace, — а также артефакты распознавания и порядок чтения реквизитов шапки бланков (КС-2/КС-3, акты), арифметическая проверка цифр. В `references/upd.md` — карта полей УПД.
 
 ### Требования
 
@@ -151,15 +162,21 @@ python3 vision_ocr.py scan.pdf photo.jpg > text.txt
 python3 vision_ocr.py big_scan.pdf --workers 6 --dpi 150 > text.txt
 ```
 
-Или импортировать функции: `ocr_pdf(path)`, `ocr_image(path)`, `vision_page(path, page_index, dpi=150)`, `crop_ocr(path, page_index, needle, det_dpi=200, dpi=800)`.
+```bash
+python3 vision_ocr.py big.pdf --pages 1-5,9 --json > blocks.json   # блоки с bbox
+python3 vision_ocr.py scan.pdf --force-ocr --workers 6            # игнорировать слой
+```
 
-Вывод: текст в stdout; для PDF страницы помечены `--- page N ---`. Ошибки отдельных страниц — маркеры `[OCR ERROR ...]`.
+Или импортировать функции: `ocr_pdf(path)`, `ocr_pdf_pages(path)`, `ocr_image(path)`, `vision_page(path, page_index, dpi=150)`, `vision_blocks(cgimage)`, `reading_order(blocks)`, `crop_ocr(path, page_index, needle, det_dpi=300, dpi=800, row=False)`.
+
+Вывод: текст в stdout в порядке чтения — клетки через таб, страницы помечены `--- page N ---`. Ошибки отдельных страниц — маркеры `[OCR ERROR ...]`.
 
 Чтение одной строки таблицы слева→направо (клетки строки с меткой):
 
 ```bash
 python3 scripts/vision_table_row.py счёт.pdf --page 1 --label "Всего к оплате"
-# → 6 200,00 | 1 033,33 | 7 233,33
+# → Всего к оплате | 6 200,00 | 1 033,33 | 7 233,33
+python3 scripts/vision_table_row.py счёт.pdf --page 1 --label "Всего к оплате" --json
 ```
 
 Высоко-резкое повторное OCR одной неразборчивой строки:
@@ -179,7 +196,8 @@ for matched, lines in vision_ocr.crop_ocr('акт.pdf', 0, 'Итого', dpi=800
 | `SKILL.md` | Промпт скилла: стратегия OCR, подводные камни pyobjc, артефакты распознавания, порядок чтения шапки бланков |
 | `vision_ocr.py` | Готовый скрипт: CLI + импортируемые функции (`ocr_pdf`, `ocr_image`, `vision_page`, `crop_ocr`) |
 | `scripts/vision_table_row.py` | CLI + хелперы для чтения одной строки таблицы по метке (`render_page`, `ocr_bboxes`) |
-| `scripts/make_test_scan.py` | Генерирует синтетический скан (текстовый PDF + PDF из картинки + PNG) для самопроверки |
+| `scripts/make_test_scan.py` | Генерирует синтетический образец (текстовый PDF + PDF из картинки + PNG) для самопроверки |
+| `scripts/selftest.py` | Прогоняет самопроверку из 21 проверки на сгенерированных образцах |
 | `references/upd.md` | Карта полей УПД: ключевые поля, строка итогов, как проверять суммы |
 
 ---
