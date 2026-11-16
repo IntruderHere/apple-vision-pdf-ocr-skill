@@ -64,11 +64,6 @@ def _scoped(func):
     return wrapper
 
 
-def _get_pool():
-    """Deprecated no-op, kept for snippets that used to call it."""
-    return None
-
-
 # -------------------------------------------------- text-layer detection ---
 _SPACE_VARIANTS = re.compile('[\u00a0\u2007\u2009\u202f]')
 
@@ -84,12 +79,36 @@ def _clean_text_layer(text):
     return '\n'.join(line.rstrip() for line in text.split('\n')).strip()
 
 
+def _span_is_visible(span):
+    """A text span a human can actually read.
+
+    Three ways PDFs carry non-content text: render mode 3 (invisible),
+    fill opacity 0, and white-on-white fill. `color` comes as an RGB(A) tuple
+    of floats from `get_texttrace()` (an int only in some builds), and
+    `opacity` is 0.0 — plain truthiness on either value reads it as visible,
+    which is how a scanned page with an EDMS stamp ends up with no OCR.
+    """
+    if span.get('type') == 3:
+        return False
+    opacity = span.get('opacity')
+    if opacity is not None and float(opacity) <= 0.05:
+        return False
+    color = span.get('color')
+    if isinstance(color, (tuple, list)) and color:
+        rgb = [float(c) for c in color[:3]]
+        if rgb and all(c >= 0.97 for c in rgb):
+            return False
+    elif isinstance(color, int) and (color & 0xFFFFFF) == 0xFFFFFF:
+        return False
+    return True
+
+
 def _text_layer_status(page):
     """(visible_chars, area_share) of the page's text layer.
 
-    Spans with render mode 3 (invisible), near-zero opacity or white fill are
-    not what a human reads — counting them as page text is how a scanned page
-    with a "Сформировано в системе ..." stamp gets silently skipped.
+    Only spans `_span_is_visible` accepts count: invisible/white text is how a
+    scanned page with a "Сформировано в системе ..." stamp gets silently
+    skipped instead of OCR'd.
     """
     try:
         spans = page.get_texttrace()
@@ -101,10 +120,7 @@ def _text_layer_status(page):
     visible_chars = 0
     area = 0.0
     for sp in spans:
-        if sp.get('type') == 3 or (sp.get('opacity') or 1) <= 0.05:
-            continue
-        color = sp.get('color')
-        if isinstance(color, int) and (color & 0xFFFFFF) == 0xFFFFFF:
+        if not _span_is_visible(sp):
             continue
         visible_chars += len(sp.get('chars') or ())
         bb = sp.get('bbox')
@@ -112,6 +128,71 @@ def _text_layer_status(page):
             area += max(0.0, bb[2] - bb[0]) * max(0.0, bb[3] - bb[1])
     page_area = max(1.0, float(page.rect.width) * float(page.rect.height))
     return visible_chars, area / page_area
+
+
+def text_layer_lines(page):
+    """The page's own text layer as reading-order lines.
+
+    Returns dicts shaped like `vision_blocks` entries (text, confidence, x, y,
+    w, h — normalised, origin bottom-left) so a text page and an OCR page come
+    out in the same order with the same tab-joined rows. Built from
+    `get_texttrace()` spans, because that is the only source that says whether
+    a span is visible (opacity / colour / render mode); spans without it fall
+    back to `get_text('dict')`.
+    """
+    width = max(1.0, float(page.rect.width))
+    height = max(1.0, float(page.rect.height))
+    out = []
+    try:
+        spans = page.get_texttrace()
+    except Exception:
+        spans = None
+    if spans:
+        for sp in spans:
+            if not _span_is_visible(sp):
+                continue
+            chars = sp.get('chars') or ()
+            raw = ''.join(chr(ch[0]) for ch in chars
+                          if isinstance(ch, (tuple, list)) and ch)
+            text = _clean_text_layer(raw)
+            bbox = sp.get('bbox')
+            if not text or not bbox:
+                continue
+            x0, y0, x1, y1 = [float(v) for v in bbox]
+            out.append({
+                'text': text,
+                'confidence': 1.0,
+                'x': max(0.0, x0) / width,
+                'y': max(0.0, 1.0 - y1 / height),
+                'w': max(0.0, x1 - x0) / width,
+                'h': max(0.0, y1 - y0) / height,
+            })
+        return out
+    try:
+        data = page.get_text('dict')
+    except Exception:
+        return out
+    for block in data.get('blocks') or []:
+        if block.get('type') != 0:
+            continue
+        for line in block.get('lines') or []:
+            bbox = line.get('bbox')
+            if not bbox:
+                continue
+            text = _clean_text_layer(''.join(
+                sp.get('text', '') for sp in (line.get('spans') or [])))
+            if not text:
+                continue
+            x0, y0, x1, y1 = [float(v) for v in bbox]
+            out.append({
+                'text': text,
+                'confidence': 1.0,
+                'x': max(0.0, x0) / width,
+                'y': max(0.0, 1.0 - y1 / height),
+                'w': max(0.0, x1 - x0) / width,
+                'h': max(0.0, y1 - y0) / height,
+            })
+    return out
 
 
 def _page_needs_ocr(page):
@@ -126,10 +207,17 @@ def _page_needs_ocr(page):
 
 # --------------------------------------------------------- rasterisation ---
 def _cgimage_from_png(tmp_path):
+    """PNG → CGImage via in-memory data.
+
+    NOT via CGImageSourceCreateWithURL: that decodes lazily, so deleting the
+    temporary file right after creation leaves an image Vision reads as blank
+    (0 blocks, no error).
+    """
     import Quartz
-    url = Quartz.CFURLCreateWithFileSystemPath(
-        None, os.path.abspath(tmp_path), Quartz.kCFURLPOSIXPathStyle, False)
-    src = Quartz.CGImageSourceCreateWithURL(url, None)
+    with open(tmp_path, 'rb') as fh:
+        data = fh.read()
+    cfdata = Quartz.CFDataCreate(None, data, len(data))
+    src = Quartz.CGImageSourceCreateWithData(cfdata, None)
     if not src:
         raise RuntimeError('cannot load image via CGImageSource')
     return Quartz.CGImageSourceCreateImageAtIndex(src, 0, None)
@@ -248,22 +336,24 @@ def _cgimage_from_pixmap(pix):
 
 
 def _pdf_page_cgimage_fitz(path, page_index, dpi=150, tmpdir=None):
-    """Fallback: render the page with PyMuPDF to PNG, then load via Quartz."""
-    tmpdir = tmpdir or os.path.dirname(os.path.abspath(__file__))
+    """Fallback: render the page with PyMuPDF, straight into a CGImage.
+
+    No PNG on disk: a file-backed image decodes lazily, so the temp file used
+    to be deleted before Vision read it (blank pages). `tmpdir` is kept for
+    backward compatibility and ignored.
+    """
     with fitz.open(path) as doc:
+        if doc.needs_pass:
+            raise RuntimeError('PDF is encrypted')
+        if page_index < 0 or page_index >= doc.page_count:
+            raise ValueError(
+                f'page {page_index + 1} does not exist: the document has '
+                f'{doc.page_count} page(s)')
         pix = doc.load_page(page_index).get_pixmap(dpi=dpi, alpha=False)
-    tmp = os.path.join(tmpdir, f'_vision_pg{page_index}_{os.getpid()}_{id(pix)}.png')
-    pix.save(tmp)
-    try:
-        img = _cgimage_from_png(tmp)
-        if not img:
-            raise RuntimeError('cannot create CGImage from rendered page')
-        return img
-    finally:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+    img = _cgimage_from_pixmap(pix)
+    if not img:
+        raise RuntimeError('cannot create CGImage from rendered page')
+    return img
 
 
 # ------------------------------------------------------------------ OCR ---
@@ -344,7 +434,7 @@ def _heading_score(blocks):
     return tallest['y'] + tallest['h'] / 2.0
 
 
-def ocr_upright(cgimage):
+def ocr_upright(cgimage, min_confidence=0.0):
     """Vision blocks of an image, rotated upright if the page is sideways.
 
     Vision recognises text at any angle but reports bboxes in the unrotated
@@ -353,7 +443,7 @@ def ocr_upright(cgimage):
     180°-rotated scans are left as Vision reads them (there is no cheap signal
     that says which way round a page is — crop/rotate it upright beforehand).
     """
-    blocks = vision_blocks(cgimage)
+    blocks = vision_blocks(cgimage, min_confidence=min_confidence)
     if not looks_rotated(blocks):
         return blocks
     candidates = []
@@ -361,7 +451,7 @@ def ocr_upright(cgimage):
         turned = rotated_cgimage(cgimage, degrees)
         if not turned:
             continue
-        alt = vision_blocks(turned)
+        alt = vision_blocks(turned, min_confidence=min_confidence)
         if alt and not looks_rotated(alt):
             candidates.append(alt)
     if not candidates:
@@ -397,7 +487,7 @@ def looks_rotated(blocks):
     return tall / float(len(blocks)) > 0.6
 
 
-def reading_order(blocks, sep='\t', rotated=None):
+def reading_order(blocks, sep='\t'):
     """Group blocks into visual lines and join them with `sep`.
 
     Vision returns blocks in no useful order — column-major output of a table
@@ -405,9 +495,7 @@ def reading_order(blocks, sep='\t', rotated=None):
     with a tab. Sideways text (a photo rotated 90°): columns are the original
     lines, read left→right, each column bottom→top.
     """
-    if rotated is None:
-        rotated = looks_rotated(blocks)
-    if rotated:
+    if looks_rotated(blocks):
         columns = []
         for b in sorted(blocks, key=lambda b: (b['x'], b['y'])):
             for column in columns:
@@ -499,7 +587,10 @@ def crop_ocr(path, page_index, needle, det_dpi=300, dpi=800, pad=25,
     Returns list of (matched_text, [lines_of_the_crop]); [] if nothing matched.
     """
     def _detect(dpi_det):
-        return ocr_upright(pdf_page_cgimage(path, page_index, dpi_det))
+        # NOT ocr_upright: bboxes must stay in the page's own coordinates,
+        # because the crop is taken from an unrotated render. A sideways page
+        # would otherwise yield boxes in rotated space and an empty crop.
+        return vision_blocks(pdf_page_cgimage(path, page_index, dpi_det))
 
     with _pool_scope():
         det_used = det_dpi
@@ -515,9 +606,11 @@ def crop_ocr(path, page_index, needle, det_dpi=300, dpi=800, pad=25,
             return []
 
         if row:
+            # on a sideways page a text line is a vertical column, not a row
+            same = _same_column if looks_rotated(blocks) else _same_line
             boxes = []
             for hit in hits:
-                line = [b for b in blocks if _same_line(b, hit)]
+                line = [b for b in blocks if same(b, hit)]
                 boxes.append((
                     hit['text'],
                     (min(b['x'] for b in line),
@@ -544,18 +637,29 @@ def _default_workers():
 
 
 def _parse_pages(spec, page_count):
-    """'1-5,9' → {1,2,3,4,5,9} (1-based, clamped to the document)."""
+    """'1-5,9' → {1,2,3,4,5,9} (1-based, clamped to the document).
+
+    An empty spec means "all pages"; anything that is not a number raises a
+    readable ValueError instead of the int() internals.
+    """
     wanted = set()
     for chunk in str(spec).replace(' ', '').split(','):
         if not chunk:
             continue
-        if '-' in chunk:
-            first, _, last = chunk.partition('-')
-            start = int(first or 1)
-            stop = int(last) if last else page_count
-            wanted.update(range(start, stop + 1))
-        else:
-            wanted.add(int(chunk))
+        try:
+            if '-' in chunk:
+                first, _, last = chunk.partition('-')
+                start = max(1, min(int(first or 1), page_count))
+                stop = max(1, min(int(last) if last else page_count, page_count))
+                if stop < start:
+                    raise ValueError
+                wanted.update(range(start, stop + 1))
+            else:
+                wanted.add(int(chunk))
+        except ValueError:
+            raise ValueError(f'bad --pages chunk {chunk!r}; expected e.g. "1-5,9"')
+    if not wanted:
+        return set(range(1, page_count + 1))
     return {p for p in wanted if 1 <= p <= page_count}
 
 
@@ -566,16 +670,22 @@ def ocr_pdf_pages(path, dpi=150, workers=None, progress=None,
 
     Returns a list of (page_no_1based, kind, payload) sorted by page, where
     kind is 'text' (trusted text layer), 'blocks' (Vision blocks) or 'error'
-    (message string). `pages` is a 1-based iterable; `force_ocr` OCRs every
-    selected page regardless of its text layer.
+    (message string). `pages` is 1-based (a spec string like "1-5,9" or any
+    iterable of ints); `force_ocr` OCRs every selected page regardless of its
+    text layer. `progress(page_index, text)` fires as pages finish, so with
+    workers > 1 the call order follows completion, not page numbers.
     """
     results = {}
     with fitz.open(path) as doc:
         if doc.needs_pass:
             raise RuntimeError('PDF is encrypted')
         count = doc.page_count
+        if count == 0:
+            raise ValueError('PDF has no pages')
         selected = (_parse_pages(pages, count) if pages is not None
                     else set(range(1, count + 1)))
+        if not selected:
+            raise ValueError(f'--pages selects no pages (document has {count})')
         text_pages = []
         job_pages = []
         for i in range(count):
@@ -583,7 +693,8 @@ def ocr_pdf_pages(path, dpi=150, workers=None, progress=None,
                 continue
             page = doc.load_page(i)
             if not force_ocr and not _page_needs_ocr(page):
-                text_pages.append((i + 1, _clean_text_layer(str(page.get_text('text')))))
+                lines = reading_order(text_layer_lines(page))
+                text_pages.append((i + 1, '\n'.join(lines)))
             else:
                 job_pages.append(i)
 
@@ -598,7 +709,8 @@ def ocr_pdf_pages(path, dpi=150, workers=None, progress=None,
         # several threads can race during module init.
         import Quartz  # noqa
         import Vision  # noqa
-        workers = workers or _default_workers()
+        workers = int(workers) if workers else _default_workers()
+        workers = max(1, min(workers, 32))
 
         def _job(page_index):
             try:
@@ -672,8 +784,7 @@ def image_blocks(path, min_confidence=0.0):
             img = _image_cgimage_via_pil(path)
         if img is None:
             raise RuntimeError(f'cannot read image: {path}')
-        return ocr_upright(img) if min_confidence <= 0 else vision_blocks(
-            img, min_confidence=min_confidence)
+        return ocr_upright(img, min_confidence=min_confidence)
 
 
 def ocr_image(path):
@@ -682,14 +793,33 @@ def ocr_image(path):
 
 
 # ------------------------------------------------------------------- CLI ---
+def _positive_int(value):
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'not an integer: {value!r}')
+    if number <= 0:
+        raise argparse.ArgumentTypeError(f'must be > 0, got {number}')
+    return number
+
+
+def _looks_like_pdf(path):
+    """PDF by content, not by extension: a PNG named .pdf is still an image."""
+    try:
+        with open(path, 'rb') as fh:
+            return fh.read(5) == b'%PDF-'
+    except OSError:
+        return path.lower().endswith('.pdf')
+
+
 def main():
     ap = argparse.ArgumentParser(
         description='Apple Vision OCR for PDFs and images (macOS).',
         epilog='Reading order: blocks of one visual line are joined by a tab.')
     ap.add_argument('files', nargs='+', help='PDF or image files')
     ap.add_argument('--workers', type=int, default=None,
-                    help='parallel OCR threads for PDFs (default: min(4, CPUs))')
-    ap.add_argument('--dpi', type=int, default=150)
+                    help='parallel OCR threads for PDFs (default: min(4, CPUs), max 32)')
+    ap.add_argument('--dpi', type=_positive_int, default=150)
     ap.add_argument('--force-ocr', action='store_true',
                     help='OCR every selected page, ignore its text layer')
     ap.add_argument('--pages', default=None,
@@ -704,10 +834,11 @@ def main():
         sys.exit('Apple Vision is available on macOS only.')
 
     payload = []
+    errors = []
     for f in args.files:
-        ext = os.path.splitext(f)[1].lower()
+        is_pdf = _looks_like_pdf(f)
         try:
-            if ext == '.pdf':
+            if is_pdf:
                 pages = ocr_pdf_pages(f, dpi=args.dpi, workers=args.workers,
                                       force_ocr=args.force_ocr, pages=args.pages)
                 rendered = []
@@ -732,6 +863,8 @@ def main():
                     print()
             else:
                 blocks = image_blocks(f)
+                if args.pages and not args.json:
+                    print(f'note: --pages is a PDF option, ignored for {f}', file=sys.stderr)
                 if args.json:
                     payload.append({'file': f, 'pages': [{'page': 1, 'blocks': blocks}]})
                 else:
@@ -740,11 +873,17 @@ def main():
                     print('\n'.join([b['text'] for b in blocks] if args.raw
                                     else reading_order(blocks)))
                     print()
-        except Exception as e:
-            sys.exit(f'ERROR {f}: {e}')
+        except Exception as e:  # keep going: one bad file must not kill the batch
+            message = f'ERROR {f}: {e}'
+            print(message, file=sys.stderr)
+            errors.append(message)
+            if args.json:
+                payload.append({'file': f, 'error': str(e)})
 
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
+    if errors:
+        sys.exit(1)
 
 
 if __name__ == '__main__':

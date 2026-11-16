@@ -50,6 +50,9 @@ def build_fixtures(outdir):
         ('wm_pdf', 'test_wm.pdf'),
         ('dense_pdf', 'test_dense_scan.pdf'),
         ('many_pdf', 'test_many_scans.pdf'),
+        ('sideways_pdf', 'test_sideways.pdf'),
+        ('hidden_pdf', 'test_hidden_text.pdf'),
+        ('layer_table_pdf', 'test_layer_table.pdf'),
     )}
 
     doc = fitz.open()
@@ -92,6 +95,40 @@ def build_fixtures(outdir):
     page.insert_image(page.rect, filename=dense_png)
     dense_scan.save(paths['dense_pdf'])
     dense_scan.close()
+
+    # «фото на боку»: картинка повёрнута, без /Rotate у страницы
+    from PIL import Image
+    sideways_png = os.path.join(outdir, 'sideways.png')
+    Image.open(paths['png']).rotate(90, expand=True).save(sideways_png)
+    side = fitz.open()
+    page = side.new_page(width=400, height=595)
+    page.insert_image(page.rect, filename=sideways_png)
+    side.save(paths['sideways_pdf'])
+    side.close()
+
+    # скан + невидимый (opacity 0) и белый текст: страница обязана уйти в OCR
+    hidden = fitz.open()
+    page = hidden.new_page(width=595, height=400)
+    page.insert_image(page.rect, filename=paths['png'])
+    page.insert_font(fontname='F1', fontfile=font)
+    page.insert_text((20, 20), 'Сформировано в системе ЭДО, подписано ЭП',
+                     fontname='F1', fontsize=10, fill_opacity=0)
+    page.insert_text((20, 40), 'Документ подписан, проверка не требуется',
+                     fontname='F1', fontsize=10, color=(1, 1, 1))
+    hidden.save(paths['hidden_pdf'])
+    hidden.close()
+
+    # таблица с настоящим текстовым слоем, нарисованная «снизу вверх»
+    table = fitz.open()
+    page = table.new_page(width=595, height=400)
+    page.insert_font(fontname='F1', fontfile=font)
+    for y, left, right in ((300, 'Итого', '137 503,38'),
+                           (200, 'Всего к оплате', '6 200,00'),
+                           (100, 'Наименование', 'Сумма')):
+        page.insert_text((40, y), left, fontname='F1', fontsize=12)
+        page.insert_text((300, y), right, fontname='F1', fontsize=12)
+    table.save(paths['layer_table_pdf'])
+    table.close()
 
     # 12 одинаковых скан-страниц: многопоточный режим и повторные прогоны
     many = fitz.open()
@@ -142,6 +179,20 @@ def main():
           vision_ocr.ocr_pdf_pages(paths['text_pdf'], force_ocr=True)[0][1] == 'blocks')
     check('_parse_pages: 2,4-5 из 6', vision_ocr._parse_pages('2,4-5', 6) == {2, 4, 5})
     check('_parse_pages: клип по границам', vision_ocr._parse_pages('0-2,99', 6) == {1, 2})
+    check('_parse_pages: пустая строка = все страницы',
+          vision_ocr._parse_pages('', 4) == {1, 2, 3, 4})
+    try:
+        vision_ocr._parse_pages('5-2,a', 10)
+        bad_spec = False
+    except ValueError:
+        bad_spec = True
+    check('_parse_pages: мусор → ValueError', bad_spec)
+    try:
+        vision_ocr.vision_page(paths['scan_pdf'], 9)
+        oob = False
+    except Exception as e:  # noqa: BLE001
+        oob = 'does not exist' in str(e)
+    check('страница за границей → понятная ошибка', oob)
 
     # --- 5. crop_ocr: регистр, отсутствие совпадений, строка целиком, retry
     hits = vision_ocr.crop_ocr(paths['scan_pdf'], 0, 'всего к оплате')
@@ -162,6 +213,37 @@ def main():
         lost = [no for no, kind, payload in many if kind != 'blocks' or not payload]
         check(f'12 страниц в 4 потока, прогон {trial + 1}: пустых нет',
               len(many) == 12 and not lost, f'страниц {len(many)}, пустые {lost}')
+
+    # --- 5c. страница «на боку»: текст читается, кроп не пустой
+    side_text = vision_ocr.ocr_pdf(paths['sideways_pdf'])
+    check('боковая страница: текст и порядок',
+          side_text.count('\n') >= 3 and 'Всего к оплате' in side_text,
+          side_text.replace('\n', ' / ')[:140])
+    side_crop = vision_ocr.crop_ocr(paths['sideways_pdf'], 0, 'Всего к оплате', row=True)
+    check('боковая страница: кроп строки не пустой',
+          bool(side_crop) and bool(side_crop[0][1]), str(side_crop)[:120])
+
+    # --- 5d. невидимый/белый текст не считается содержимым страницы
+    hidden_pages = vision_ocr.ocr_pdf_pages(paths['hidden_pdf'])
+    hidden_text = vision_ocr.ocr_pdf(paths['hidden_pdf'])
+    check('opacity 0 / белый текст: страница уходит в OCR',
+          hidden_pages[0][1] == 'blocks', hidden_pages[0][1])
+    check('opacity 0 / белый текст: штамп не в выдаче',
+          'Сформировано' not in hidden_text and 'Всего к оплате' in hidden_text,
+          hidden_text.replace('\n', ' / ')[:140])
+
+    # --- 5e. текстовая страница: порядок чтения как у OCR, клетки через таб
+    layer_lines = vision_ocr.ocr_pdf(paths['layer_table_pdf']).splitlines()
+    check('текстовый слой: строки сверху вниз',
+          layer_lines[1:2] == ['--- page 1 ---'] or
+          layer_lines.index('Наименование\tСумма') < layer_lines.index('Итого\t137 503,38'),
+          ' / '.join(layer_lines[:5]))
+    check('текстовый слой: клетки склеены табом',
+          any('\t' in line for line in layer_lines), ' / '.join(layer_lines[:5]))
+
+    # --- 5f. fallback-рендер (Quartz не читает страницу) не даёт пустую страницу
+    fb_img = vision_ocr._pdf_page_cgimage_fitz(paths['scan_pdf'], 0, 150)
+    check('fallback-рендер читается Vision', len(vision_ocr.vision_blocks(fb_img)) > 0)
 
     # --- 6. vision_blocks: геометрия и уверенность
     blocks = vision_ocr.vision_blocks(vision_ocr.pdf_page_cgimage(paths['scan_pdf'], 0, 150))
@@ -192,6 +274,29 @@ def main():
         check('CLI --json разбирается', False, f'{e}: {js.stdout[:120]}')
     else:
         check('CLI --json разбирается', has_blocks)
+
+    # --- 8. CLI: батч не обрывается, ошибки видны, расширение не решает
+    import shutil as _shutil
+    broken = os.path.join(outdir, 'broken.pdf')
+    with open(broken, 'wb') as fh:
+        fh.write(b'not a pdf at all')
+    fake_pdf = os.path.join(outdir, 'fake.pdf')
+    _shutil.copyfile(paths['png'], fake_pdf)
+    cli = os.path.join(_SKILL_DIR, 'vision_ocr.py')
+    batch = subprocess.run([sys.executable, cli, paths['scan_pdf'], broken],
+                           capture_output=True, text=True)
+    check('CLI: битый файл не обрывает батч',
+          batch.returncode == 1 and 'Всего к оплате' in batch.stdout
+          and 'broken.pdf' in batch.stderr, (batch.stdout or '')[:80] + '|' + (batch.stderr or '')[:80])
+    pages_out = subprocess.run([sys.executable, cli, paths['scan_pdf'], '--pages', '0'],
+                               capture_output=True, text=True)
+    check('CLI: --pages вне диапазона — ошибка, а не тишина',
+          pages_out.returncode == 1 and 'selects no pages' in pages_out.stderr,
+          pages_out.stderr.strip()[:100])
+    fake = subprocess.run([sys.executable, cli, fake_pdf], capture_output=True, text=True)
+    check('CLI: PNG с именем .pdf распознаётся как картинка',
+          fake.returncode == 0 and 'Всего к оплате' in fake.stdout,
+          (fake.stdout or fake.stderr).strip()[:100])
 
     if args.keep:
         print(f'\nfixtures: {outdir}')

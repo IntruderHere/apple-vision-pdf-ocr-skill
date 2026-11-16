@@ -5,9 +5,9 @@
 строку одной линией: блоки, чей y-центр попадает в полосу вокруг метки,
 отсортированные по x (слева направо).
 
-Использование:
-    python3 vision_table_row.py scan.pdf --page 1 --label "Всего к оплате"
-    python3 vision_table_row.py scan.pdf --page 0 --label "Итого" --dpi 300
+Использование (`--page` — 0-based, как и везде в этом скилле):
+    python3 vision_table_row.py scan.pdf --page 0 --label "Всего к оплате"
+    python3 vision_table_row.py scan.pdf --page 1 --label "Итого" --dpi 300
     python3 vision_table_row.py scan.pdf --page 0 --label "Итого" --json
 
 Полоса по умолчанию — 0.6 высоты самой метки: соседняя строка попадает в неё
@@ -42,6 +42,7 @@ def ocr_bboxes(cgimage):
             'y_center': b['y'] + b['h'] / 2.0,
             'x0': b['x'],
             'x1': b['x'] + b['w'],
+            'w': b['w'],
             'h': b['h'],
             'confidence': b['confidence'],
         })
@@ -69,7 +70,10 @@ def main():
                     help='emit cells as JSON objects instead of one line')
     a = ap.parse_args()
 
-    blocks = ocr_bboxes(render_page(a.path, a.page, a.dpi))
+    try:
+        blocks = ocr_bboxes(render_page(a.path, a.page, a.dpi))
+    except Exception as e:  # noqa: BLE001 — CLI must not dump a traceback
+        sys.exit(f'cannot read page {a.page} of {a.path}: {e}')
     needle = vision_ocr._normalize(a.label)
     labels = [b for b in blocks if needle and needle in vision_ocr._normalize(b['text'])]
     if not labels:
