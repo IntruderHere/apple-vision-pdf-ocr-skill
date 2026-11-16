@@ -139,6 +139,113 @@ def vision_page(path, page_index, dpi=150):
     return _vision_page(path, page_index, dpi)
 
 
+def _ocr_bboxes(img):
+    """Vision OCR with geometry: list of (text, x, y, w, h) in normalized
+    coordinates (origin bottom-left, as Vision boundingBox())."""
+    import Vision
+    _get_pool()
+    req = Vision.VNRecognizeTextRequest.alloc().init()
+    req.setRecognitionLanguages_(["ru-RU", "en-US"])
+    req.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+    req.setUsesLanguageCorrection_(True)
+    handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(img, None)
+    handler.performRequests_error_([req], None)
+    out = []
+    for obs in req.results() or []:
+        cands = obs.topCandidates_(1)
+        if cands:
+            b = obs.boundingBox()
+            out.append((str(cands[0].string()).strip(),
+                        b.origin.x, b.origin.y, b.size.width, b.size.height))
+    return out
+
+
+def crop_ocr(path, page_index, needle, det_dpi=200, dpi=800, pad=25):
+    """High-res OCR of a single line of a PDF page (two-stage).
+
+    Stage 1: Vision at `det_dpi` (fast) finds every text box whose text
+    contains `needle`. Stage 2: that strip is cropped from a high-res
+    render at `dpi` (bbox scales linearly) and only the crop is OCR'd.
+    Full-page Vision at 600+ dpi is very slow — this is not. Cheap and
+    accurate for garbled formulas, requisites, superscripts. `pad` is in
+    det_dpi pixels, scaled to the crop. Returns list of
+    (matched_line_text, [crop_lines]); [] if nothing matched.
+    """
+    import Quartz
+    import tempfile
+
+    def _png_to_img(png_path):
+        url = Quartz.CFURLCreateWithFileSystemPath(
+            None, os.path.abspath(png_path), Quartz.kCFURLPOSIXPathStyle, False)
+        src = Quartz.CGImageSourceCreateWithURL(url, None)
+        return Quartz.CGImageSourceCreateImageAtIndex(src, 0, None)
+
+    fd, tmp = tempfile.mkstemp(suffix='.png')
+    os.close(fd)
+    boxes = []
+    try:
+        with fitz.open(path) as doc:
+            pix = doc.load_page(page_index).get_pixmap(dpi=det_dpi, alpha=False)
+        pix.save(tmp)
+        img = _png_to_img(tmp)
+        if img:
+            boxes = _ocr_bboxes(img)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    hits = [b for b in boxes if needle in b[0]]
+    if not hits:
+        return []
+
+    fd2, tmp2 = tempfile.mkstemp(suffix='.png')
+    os.close(fd2)
+    try:
+        with fitz.open(path) as doc:
+            big = doc.load_page(page_index).get_pixmap(dpi=dpi, alpha=False)
+        big.save(tmp2)
+        bigimg = _png_to_img(tmp2)
+        if not bigimg:
+            return []
+        W, H = big.width, big.height
+        scale = dpi / float(det_dpi)
+        pad_hi = int(pad * scale)
+        results = []
+        for t, x, y, w, h in hits:
+            y1 = max(0, int((1 - (y + h)) * H) - pad_hi)
+            y2 = min(H, int((1 - y) * H) + pad_hi)
+            x1 = max(0, int(x * W) - pad_hi)
+            x2 = min(W, int((x + w) * W) + pad_hi)
+            sub = Quartz.CGImageCreateWithImageInRect(
+                bigimg, Quartz.CGRectMake(x1, y1, x2 - x1, y2 - y1))
+            fd3, tmp3 = tempfile.mkstemp(suffix='.png')
+            os.close(fd3)
+            c3 = os.path.abspath(tmp3)
+            dest = Quartz.CGImageDestinationCreateWithURL(
+                Quartz.CFURLCreateWithFileSystemPath(
+                    None, c3, Quartz.kCFURLPOSIXPathStyle, False),
+                'public.png', 1, None)
+            Quartz.CGImageDestinationAddImage(dest, sub, None)
+            Quartz.CGImageDestinationFinalize(dest)
+            src3 = Quartz.CGImageSourceCreateWithURL(
+                Quartz.CFURLCreateWithFileSystemPath(
+                    None, c3, Quartz.kCFURLPOSIXPathStyle, False), None)
+            subimg = Quartz.CGImageSourceCreateImageAtIndex(src3, 0, None)
+            lines = vision_ocr_lines(subimg) if subimg else []
+            try:
+                os.unlink(tmp3)
+            except OSError:
+                pass
+            results.append((t, lines))
+        return results
+    finally:
+        try:
+            os.unlink(tmp2)
+        except OSError:
+            pass
+
+
 # ------------------------------------------------------------- documents ---
 def ocr_pdf(path, dpi=150, workers=1, progress=None):
     """Return full text of a PDF: text layer where present, Vision OCR for
